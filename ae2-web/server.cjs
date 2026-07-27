@@ -1,55 +1,93 @@
-// server.cjs
 const WebSocket = require('ws');
-const http = require('http');
-const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
-const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const PORT = 6767;
+const JSON_PATH = path.join(__dirname, 'items.json');
 
-app.use(express.static(__dirname));
+const wss = new WebSocket.Server({ port: PORT });
+console.log(`WebSocket server running on port ${PORT}`);
 
-let globalItemState = {};
+let chunkBuffer = "";
+
+function processAndSaveItems(jsonString) {
+    try {
+        const parsed = JSON.parse(jsonString);
+        
+        let rawItems = [];
+        if (Array.isArray(parsed)) {
+            rawItems = parsed;
+        } else if (parsed.items && Array.isArray(parsed.items)) {
+            rawItems = parsed.items;
+        }
+
+        const aggregated = {};
+        for (const item of rawItems) {
+            const key = item.name || item.id || 'unknown';
+            const qty = Number(item.amount || item.count || 0);
+            const label = item.displayName || item.label || key;
+
+            if (qty > 0) {
+                if (!aggregated[key]) {
+                    aggregated[key] = {
+                        name: key,
+                        displayName: label,
+                        amount: qty
+                    };
+                } else {
+                    aggregated[key].amount += qty;
+                }
+            }
+        }
+
+        const itemList = Object.values(aggregated);
+
+        const outputPayload = {
+            itemCount: itemList.length,
+            items: itemList
+        };
+
+        fs.writeFileSync(JSON_PATH, JSON.stringify(outputPayload, null, 2));
+        console.log(`[${new Date().toLocaleTimeString()}] Saved ${itemList.length} item types to items.json`);
+
+        broadcast(JSON.stringify(outputPayload));
+    } catch (err) {
+        console.error("Failed to parse or write snapshot:", err.message);
+    }
+}
 
 wss.on('connection', (ws) => {
-    console.log('Client connected');
-
-    ws.send(JSON.stringify({ type: 'full', items: globalItemState }));
+    console.log('CC Turtle / Client connected');
 
     ws.on('message', (message) => {
+        const msgString = message.toString();
+
         try {
-            const data = JSON.parse(message);
+            const msg = JSON.parse(msgString);
 
-            if (data.type === 'full') {
-                globalItemState = data.items;
-                broadcast(data);
+            if (msg.type === 'start_stream') {
+                chunkBuffer = "";
+            } else if (msg.type === 'chunk') {
+                chunkBuffer += msg.data;
+            } else if (msg.type === 'end_stream') {
+                processAndSaveItems(chunkBuffer);
+                chunkBuffer = "";
             } 
-            else if (data.type === 'delta') {
-
-                for (const [name, item] of Object.entries(data.changes)) {
-                    if (item.amount <= 0) {
-                        delete globalItemState[name];
-                    } else {
-                        globalItemState[name] = item;
-                    }
-                }
-                broadcast(data);
+            else if (msg.type === 'full_snapshot' || Array.isArray(msg)) {
+                processAndSaveItems(msgString);
             }
-        } catch (err) {
-            console.error('Invalid message received:', err);
+        } catch (e) {
+            processAndSaveItems(msgString);
         }
     });
+
+    ws.on('close', () => console.log('Client disconnected'));
 });
 
 function broadcast(data) {
-    const payload = JSON.stringify(data);
     wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
-            client.send(payload);
+            client.send(data);
         }
     });
 }
-
-server.listen(3000, () => {
-    console.log('Server running on http://localhost:3000');
-});

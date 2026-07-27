@@ -1,91 +1,76 @@
-SERVER_NAME = "ragnamod"
-WS_URL = "wss://ae2-ws.s0cks.rocks"
+local WS_URL = "wss://<url_here>"
+local INTERVAL_SECONDS = 30
+local CHUNK_SIZE = 60000
 
-local ws = assert(http.websocket(WS_URL))
-print("WebSocket connected.")
+local me = peripheral.find("meBridge") or peripheral.find("me_bridge") or peripheral.find("advancedPeripherals:me_bridge") or peripheral.find("ae2:interface")
 
-local me = assert(peripheral.find("meBridge"), "ME Bridge not found!")
-
-
-local lastState = {}
-
-local function getInventorySnapshot()
-    local rawItems = me.listItems()
-    local state = {}
-    for _, item in ipairs(rawItems) do
-
-        state[item.name] = {
-            displayName = item.displayName,
-            amount = item.amount
-        }
-    end
-    return state
+if not me then
+    error("No ME Bridge or AE2 interface attached!")
 end
 
-local function sendFullSnapshot()
-    local currentState = getInventorySnapshot()
-    lastState = currentState
-
-    local payload = {
-        type = "full",
-        server = SERVER_NAME,
-        items = currentState
-    }
-    ws.send(textutils.serializeJSON(payload))
-    print("Full snapshot sent.")
-end
-
-local function sendDeltaUpdate()
-    local currentState = getInventorySnapshot()
-    local changes = {}
-    local hasChanges = false
-
-    for name, data in pairs(currentState) do
-        local prev = lastState[name]
-        if not prev or prev.amount ~= data.amount then
-            changes[name] = {
-                displayName = data.displayName,
-                amount = data.amount
-            }
-            hasChanges = true
+local function sendChunked(ws, payload)
+    local len = #payload
+    if len <= CHUNK_SIZE then
+        ws.send(payload)
+    else
+        local totalChunks = math.ceil(len / CHUNK_SIZE)
+        ws.send(textutils.serializeJSON({ type = "start_stream", total = totalChunks }))
+        
+        for i = 1, len, CHUNK_SIZE do
+            local chunk = payload:sub(i, math.min(i + CHUNK_SIZE - 1, len))
+            ws.send(textutils.serializeJSON({ type = "chunk", data = chunk }))
         end
-    end
-
-    for name, prev in pairs(lastState) do
-        if not currentState[name] then
-            changes[name] = {
-                displayName = prev.displayName,
-                amount = 0
-            }
-            hasChanges = true
-        end
-    end
-
-    if hasChanges then
-        local payload = {
-            type = "delta",
-            server = SERVER_NAME,
-            changes = changes
-        }
-        ws.send(textutils.serializeJSON(payload))
-        print("Delta update transmitted!")
-
-        lastState = currentState
+        
+        ws.send(textutils.serializeJSON({ type = "end_stream" }))
     end
 end
 
-sendFullSnapshot()
+print("Connecting to WebSocket server: " .. WS_URL)
+local ws, err = http.websocket(WS_URL)
 
-local timer = os.startTimer(2)
+if not ws then
+    error("WebSocket connection failed: " .. tostring(err))
+end
+
+print("Connected! Pushing snapshots every " .. INTERVAL_SECONDS .. "s...")
 
 while true do
-    local event, id = os.pullEvent()
+    print("[" .. textutils.formatTime(os.time(), true) .. "] Fetching inventory...")
+    local rawItems = me.listItems() or me.getItems() or {}
+    local itemList = {}
 
-    if event == "timer" and id == timer then
-        sendDeltaUpdate()
-        timer = os.startTimer(2)
+    for _, item in ipairs(rawItems) do
+        local name = item.name or item.id or "unknown"
+        local amount = item.count or item.amount or 0
+        local displayName = item.displayName or item.label or name
 
-    elseif event == "websocket_message" then
-        print("Server msg: " .. id)
+        if amount > 0 then
+            table.insert(itemList, {
+                name = name,
+                displayName = displayName,
+                amount = amount
+            })
+        end
     end
+
+    -- Create full snapshot JSON
+    local payload = textutils.serializeJSON({
+        type = "full_snapshot",
+        items = itemList
+    })
+
+    print("Transmitting snapshot (" .. #itemList .. " items, " .. #payload .. " bytes)...")
+    
+    local success, sendErr = pcall(function()
+        sendChunked(ws, payload)
+    end)
+
+    if not success then
+        print("Send error: " .. tostring(sendErr) .. ". Attempting reconnect...")
+        ws.close()
+        sleep(2)
+        ws = http.websocket(WS_URL)
+    end
+
+    sleep(INTERVAL_SECONDS)
 end
